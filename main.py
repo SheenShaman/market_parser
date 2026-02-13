@@ -2,156 +2,206 @@ import logging
 import asyncio
 import httpx
 
-from constants import HEADERS, SEARCH_URL, QUERY
-from models import Product
+from constants import DETAIL_URL, FAILURE_STATUS, HEADERS, SEARCH_URL, \
+    PARAMS_TEMPLATE, MAX_BASKET
+from models import Product, DetailProduct
 from logger import setup_logging
-
 
 setup_logging()
 logger = logging.getLogger(__name__)
 
+BASKET_CACHE = {}
 
-async def safe_get(client: httpx.AsyncClient, params):
+
+async def safe_get_json(
+        client: httpx.AsyncClient,
+        url: str,
+        params: dict | None = None,
+) -> dict | None:
+    """
+    Делает запрос, если падает ошибка - делает повторный запрос
+    """
     for attempt in range(5):
         try:
-            response = await client.get(SEARCH_URL, params=params)
-            if response.status_code == 429:
-                wait = 2 ** attempt
-                print(f"429, ждём {wait} сек...")
+            response = await client.get(url, params=params)
+            if response.status_code in FAILURE_STATUS:
+                wait = min(2 ** attempt, 8)
+                logger.warning(
+                    f"{url} | {response.status_code} | retry in {wait}s"
+                )
                 await asyncio.sleep(wait)
                 continue
 
             response.raise_for_status()
             return response.json()
 
-        except httpx.RequestError:
-            wait = 2 ** attempt
+        except (httpx.RequestError, httpx.HTTPStatusError) as e:
+            wait = min(2 ** attempt, 8)
             await asyncio.sleep(wait)
-
-    raise Exception("Слишком много 429")
-
-
-async def get_page(client: httpx.AsyncClient, page: int):
-    params = {
-        "appType": 1,
-        "curr": "rub",
-        "dest": -1257786,
-        "query": QUERY,
-        "page": page,
-        "resultset": "catalog",
-        "sort": "popular",
-    }
-
-    return await safe_get(client, params)
+    return None
 
 
-async def get_card_json(client: httpx.AsyncClient, nm_id: int) -> tuple[dict, str] | None:
-    vol = nm_id // 100000
-    part = nm_id // 1000
-
-    tasks = []
-    urls = []
-
-    for basket in range(1, 30):
-        basket_url = (
-            f"https://basket-{basket}.wbbasket.ru/"
-            f"vol{vol}/part{part}/{nm_id}"
-        )
-        urls.append(basket_url)
-        tasks.append(client.get(basket_url + "/info/ru/card.json", timeout=2))
-
-    responses = await asyncio.gather(*tasks, return_exceptions=True)
-
-    for response, basket_url in zip(responses, urls):
-        if isinstance(response, Exception):
-            continue
-        if response.status_code == 200:
-            return response.json(), basket_url
-
-    return None, None
-
-
-async def build_product(client, search_item, semaphore) -> Product:
+async def get_detail_data(
+        client: httpx.AsyncClient, nm_id: str, semaphore: asyncio.Semaphore
+) -> DetailProduct | None:
+    """
+    Возвращает данные товара по detail_url
+    """
     async with semaphore:
-        nm_id = search_item["id"]
-        card_data, basket_url = await get_card_json(client, nm_id)
+        params = {
+            "appType": 1,
+            "curr": "rub",
+            "dest": -1257786,
+            "nm": str(nm_id),
+        }
+        data = await safe_get_json(client, DETAIL_URL, params=params)
+        if not data:
+            return None
+        products = data.get("products") or data.get("data", {}).get("products")
+        if not products:
+            return None
+        product = products[0]
+        # считаем среднюю цену по размера
+        sizes_data = product.get("sizes", [])
+        stock = 0
+        for size in sizes_data:
+            for s in size.get("stocks", []):
+                stock += s.get("qty", 0)
+        if stock == 0:
+            return None
+        prices = [
+            size.get("price", {}).get("product")
+            for size in sizes_data
+            if size.get("price", {}).get("product")
+        ]
+        price = (sum(prices) / len(prices)) / 100 if prices else 0
 
-        if not card_data:
+        return DetailProduct(
+            id=product.get("id"),
+            name=product.get("name"),
+            price=price,
+            supplier=product.get("supplier"),
+            supplierId=product.get("supplierId"),
+            reviewRating=product.get("reviewRating"),
+            feedbacks=product.get("feedbacks"),
+            sizes=[size.get("name") for size in sizes_data],
+            stock=stock,
+        )
+
+
+async def get_basket(
+        client: httpx.AsyncClient, nm_id: int, semaphore: asyncio.Semaphore
+) -> tuple[str | None, dict | None]:
+    async with semaphore:
+        vol = nm_id // 100000
+        part = nm_id // 1000
+        card_path = f"/vol{vol}/part{part}/{nm_id}/info/ru/card.json"
+
+        if vol in BASKET_CACHE:
+            basket = BASKET_CACHE[vol]
+            url = f"https://basket-{basket}.wbbasket.ru{card_path}"
+            data = await safe_get_json(client, url)
+            if data:
+                return f"https://basket-{basket}.wbbasket.ru/vol{vol}/part{part}/{nm_id}"
+            BASKET_CACHE.pop(vol, None)
+
+        for basket in range(1, MAX_BASKET):
+            base_url = f"https://basket-{basket}.wbbasket.ru"
+            full_url = f"{base_url}{card_path}"
+            data = await safe_get_json(client, full_url)
+            if data:
+                BASKET_CACHE[vol] = basket
+                return f"{base_url}/vol{vol}/part{part}/{nm_id}", data
+
+        logger.warning(f"Не найден basket для {nm_id}")
+        return None
+
+
+async def get_basket_data(
+        client: httpx.AsyncClient,
+        nm_id: int,
+        semaphore: asyncio.Semaphore
+) -> tuple[str | None, list[str], dict]:
+    basket_url, data = await get_basket(client, nm_id, semaphore)
+    if not basket_base or not data:
+        return None, [], {}
+
+    description = data.get("description")
+    characteristics = {
+        opt.get("name"): opt.get("value")
+        for opt in data.get("options", [])
+        if opt.get("name") and opt.get("value")
+    }
+    photo_count = data.get("media", {}).get("photo_count", 0)
+    images = [
+        f"{basket_base}/images/c516x688/{i}.webp"
+        for i in range(1, photo_count + 1)
+    ]
+    return description, images, characteristics
+
+
+async def build_product(
+        client: httpx.AsyncClient,
+        nm_id: str,
+        semaphore: asyncio.Semaphore
+) -> Product:
+    async with semaphore:
+        detail_data = await get_detail_data(client, nm_id, semaphore)
+        if not detail_data:
             logger.warning(f"Не найдена карточка {nm_id}")
             return None
 
-        url = f"https://www.wildberries.ru/catalog/{nm_id}/detail.aspx"
-        name = search_item.get("name")
-        rating = search_item.get("reviewRating", 0)
-        feedbacks = search_item.get("feedbacks", 0)
-        seller_name = search_item.get("supplier")
-        seller_url = f"https://www.wildberries.ru/seller/{search_item.get('supplierId')}"
-        description = card_data.get("description")
-
-        # считаем среднюю цену по размерам
-        sizes_data = search_item.get("sizes", [])
-        prices = []
-        for size in sizes_data:
-            price_info = size.get("price", {})
-            product_price = price_info.get("product")
-            if product_price:
-                prices.append(product_price)
-        if prices:
-            price = (sum(prices) / len(prices)) / 100
-        else:
-            price = 0
-
-        # считаем кол-во остатков по размерам
-        sizes = []
-        stock = 0
-        for size in search_item.get("sizes", []):
-            size_name = size.get("name")
-            sizes.append(size_name)
-            if size.get("stocks"):
-                for stock_item in size["stocks"]:
-                    stock += stock_item.get("qty", 0)
-
-        # собираем характеристики
-        characteristics = {}
-        for option in card_data.get("options", []):
-            key = option.get("name")
-            value = option.get("value")
-            characteristics[key] = value
-
-        photo_count = card_data.get("media", {}).get("photo_count", 0)
-        images = [
-            f"{basket_url}/images/c516x688/{i}.webp"
-            for i in range(1, photo_count + 1)
-        ]
+        # собираем характеристики, изображения, описание
+        description, images, characteristics = await get_basket_data(
+            client,
+            detail_data.id,
+            semaphore
+        )
 
         return Product(
-            url=url,
-            article=nm_id,
-            name=name,
-            price=price,
+            url=f"https://www.wildberries.ru/catalog/{detail_data.id}/detail.aspx",
+            article=detail_data.id,
+            name=detail_data.name,
+            price=detail_data.price,
             description=description,
             images=images,
             characteristics=characteristics,
-            seller_name=seller_name,
-            seller_url=seller_url,
-            sizes=sizes,
-            stock=stock,
-            rating=rating,
-            feedbacks=feedbacks,
+            seller_name=detail_data.supplier,
+            seller_url=f"https://www.wildberries.ru/seller/{detail_data.supplierId}",
+            sizes=detail_data.sizes,
+            stock=detail_data.stock,
+            rating=detail_data.reviewRating,
+            feedbacks=detail_data.feedbacks,
         )
 
 
 async def main():
-    semaphore = asyncio.Semaphore(10)
+    semaphore = asyncio.Semaphore(15)
     async with httpx.AsyncClient(
-        headers=HEADERS,
-        timeout=20,
+            headers=HEADERS,
+            timeout=20,
+            http2=True,
+            limits=httpx.Limits(
+                max_connections=50,
+                max_keepalive_connections=20
+            )
     ) as client:
-        page_data = await get_page(client,1)
-        items = page_data["products"][:5]
+        # получение товаров на странице
+        page_data = await safe_get_json(
+            client,
+            url=SEARCH_URL,
+            params=PARAMS_TEMPLATE,
+
+        )
+        # получение артикулов товаров
+        data = page_data.get("products") or page_data.get("data", {}).get(
+            "products")
+        product_ids = [
+            str(product.get('id')) for product in data
+        ]
         tasks = [
-            build_product(client, item, semaphore)
-            for item in items
+            build_product(client, product_id, semaphore)
+            for product_id in product_ids
         ]
         results = await asyncio.gather(*tasks)
         products = [p for p in results if p]

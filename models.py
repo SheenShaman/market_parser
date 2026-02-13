@@ -15,3 +15,14 @@ class Product(BaseModel):
     stock: int
     rating: float
     feedbacks: int
+
+class DetailProduct(BaseModel):
+    id: int
+    name: str
+    price: float
+    supplier: str
+    supplierId: int
+    reviewRating: float
+    feedbacks: int
+    sizes: list[str]
+    stock: int
