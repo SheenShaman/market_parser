@@ -9,14 +9,23 @@ from constants import (
     SEARCH_URL,
     PARAMS_TEMPLATE,
     MAX_BASKET,
+    MIN_BASKET,
 )
 from models import Product, DetailProduct
 from logger import setup_logging
+from export_to_excel import export_to_excel
 
 setup_logging()
 logger = logging.getLogger(__name__)
 
-BASKET_CACHE = {}
+BASKET_CACHE: dict[int, int] = {}
+
+
+def get_card_path(nm_id: int) -> tuple[int, int, str]:
+    vol = nm_id // 100000
+    part = nm_id // 1000
+    card_path = f"/vol{vol}/part{part}/{nm_id}/info/ru/card.json"
+    return vol, part, card_path
 
 
 async def safe_get_json(
@@ -32,7 +41,6 @@ async def safe_get_json(
             response = await client.get(url, params=params)
             if response.status_code in FAILURE_STATUS:
                 wait = min(2**attempt, 8)
-                logger.warning(f"{url} | {response.status_code} | retry in {wait}s")
                 await asyncio.sleep(wait)
                 continue
 
@@ -41,7 +49,6 @@ async def safe_get_json(
 
         except (httpx.RequestError, httpx.HTTPStatusError):
             wait = min(2**attempt, 8)
-            logger.warning(f"{url} | retry in {wait}s")
             await asyncio.sleep(wait)
     return None
 
@@ -67,10 +74,7 @@ async def get_detail_data(
     product = products[0]
     # считаем среднюю цену по размера
     sizes_data = product.get("sizes", [])
-    stock = 0
-    for size in sizes_data:
-        for s in size.get("stocks", []):
-            stock += s.get("qty", 0)
+    stock = sum(s.get("qty", 0) for size in sizes_data for s in size.get("stocks", []))
     if stock == 0:
         return None
     prices = [
@@ -94,11 +98,13 @@ async def get_detail_data(
 
 
 async def get_basket(
-    client: httpx.AsyncClient, nm_id: int
+    client: httpx.AsyncClient,
+    nm_id: int,
 ) -> tuple[str | None, dict | None]:
-    vol = nm_id // 100000
-    part = nm_id // 1000
-    card_path = f"/vol{vol}/part{part}/{nm_id}/info/ru/card.json"
+    """
+    Поиск basket
+    """
+    vol, part, card_path = get_card_path(nm_id)
 
     if vol in BASKET_CACHE:
         basket = BASKET_CACHE[vol]
@@ -108,7 +114,7 @@ async def get_basket(
             return f"https://basket-{basket}.wbbasket.ru/vol{vol}/part{part}/{nm_id}"
         BASKET_CACHE.pop(vol, None)
 
-    for basket in range(1, MAX_BASKET):
+    for basket in range(MIN_BASKET, MAX_BASKET):
         base_url = f"https://basket-{basket}.wbbasket.ru"
         full_url = f"{base_url}{card_path}"
         data = await safe_get_json(client, full_url)
@@ -116,7 +122,6 @@ async def get_basket(
             BASKET_CACHE[vol] = basket
             return f"{base_url}/vol{vol}/part{part}/{nm_id}", data
 
-    logger.warning(f"Не найден basket для {nm_id}")
     return None, None
 
 
@@ -124,6 +129,9 @@ async def get_basket_data(
     client: httpx.AsyncClient,
     nm_id: int,
 ) -> tuple[str | None, list[str], dict]:
+    """
+    Находим описание, изображения, характеристики по basket
+    """
     basket_url, data = await get_basket(client, nm_id)
     if not basket_url or not data:
         return None, [], {}
@@ -144,6 +152,9 @@ async def get_basket_data(
 async def build_product(
     client: httpx.AsyncClient, nm_id: str, semaphore: asyncio.Semaphore
 ) -> Product:
+    """
+    Сборка модели товара
+    """
     async with semaphore:
         detail_data = await get_detail_data(client, nm_id)
         if not detail_data:
@@ -173,12 +184,12 @@ async def build_product(
 
 
 async def main():
-    semaphore = asyncio.Semaphore(15)
+    semaphore = asyncio.Semaphore(60)
     async with httpx.AsyncClient(
         headers=HEADERS,
-        timeout=20,
+        timeout=15,
         http2=True,
-        limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
+        limits=httpx.Limits(max_connections=120, max_keepalive_connections=60),
     ) as client:
         # получение товаров на странице
         page_data = await safe_get_json(
@@ -193,11 +204,9 @@ async def main():
             build_product(client, product_id, semaphore) for product_id in product_ids
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        products = [p for p in results if p]
-        logger.info(f"Собрано товаров: {len(products)}")
-        logger.info(f"Товары: {[p for p in results if p]}")
-        return products
+        products = [p for p in results if isinstance(p, Product)]
+        export_to_excel(products)
 
 
 if __name__ == "__main__":
-    products = asyncio.run(main())
+    asyncio.run(main())

@@ -18,17 +18,20 @@ PARAMS_TEMPLATE = {
     "appType": "1",
     "curr": "rub",
     "dest": "-1257786",
-    "hide_dtype": "9",
+    "f14177451": "15000203",
+    "frating": "1",
     "hide_vflags": "4294967296",
     "inheritFilters": "false",
     "lang": "ru",
     "page": "1",
+    "priceU": "73400;1000000",
+    "query": QUERY,
     "resultset": "catalog",
     "sort": "popular",
     "spp": "30",
     "suppressSpellcheck": "false",
-    "query": QUERY,
 }
 
 FAILURE_STATUS = (429, 500, 502, 503, 504)
 MAX_BASKET = 30
+MIN_BASKET = 20

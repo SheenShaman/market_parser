@@ -16,6 +16,7 @@ class Product(BaseModel):
     rating: float
     feedbacks: int
 
+
 class DetailProduct(BaseModel):
     id: int
     name: str
